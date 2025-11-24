@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { QRCodeSVG } from 'qrcode.react';
-import { QrCode, Copy, Download, RefreshCw, DollarSign, CheckCircle } from 'lucide-react';
+import { QrCode, Copy, Download, RefreshCw, DollarSign, CheckCircle, Loader, Clock } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
+import { generateQRCode as generateQRAPI } from '../services/qrService';
 import toast from 'react-hot-toast';
 
 const QRPayment = () => {
@@ -9,28 +10,88 @@ const QRPayment = () => {
   const [amount, setAmount] = useState('');
   const [message, setMessage] = useState('');
   const [qrData, setQrData] = useState(null);
+  const [qrSignature, setQrSignature] = useState(null);
+  const [loading, setLoading] = useState(false);
   const [activeTab, setActiveTab] = useState('receive');
+  const [expiresAt, setExpiresAt] = useState(null);
+  const [timeRemaining, setTimeRemaining] = useState('');
 
   useEffect(() => {
     generateQRCode();
-  }, [user, amount, message]);
+  }, [user, amount]);
 
-  const generateQRCode = () => {
+  useEffect(() => {
+    // Update timer every second
+    if (expiresAt) {
+      const timer = setInterval(() => {
+        const now = new Date();
+        const diff = expiresAt - now;
+        
+        if (diff <= 0) {
+          setTimeRemaining('Expired');
+          toast.error('QR Code expired, generating new one...');
+          generateQRCode();
+        } else {
+          const minutes = Math.floor(diff / 60000);
+          const seconds = Math.floor((diff % 60000) / 1000);
+          setTimeRemaining(`${minutes}:${seconds.toString().padStart(2, '0')}`);
+        }
+      }, 1000);
+      
+      return () => clearInterval(timer);
+    }
+  }, [expiresAt]);
+
+  const generateQRCode = async () => {
     if (!user) return;
 
-    const data = {
-      type: 'bluepay',
-      action: 'payment',
-      recipient: {
-        phone: user.phone,
-        name: user.name,
-      },
-      amount: amount ? parseFloat(amount) : null,
-      message: message || null,
-      timestamp: Date.now(),
-    };
-
-    setQrData(JSON.stringify(data));
+    setLoading(true);
+    try {
+      // Call backend API to generate proper QR code format
+      const result = await generateQRAPI(amount ? parseFloat(amount) : null);
+      
+      if (result.success) {
+        const { qr_data, signature, expires_at } = result.data;
+        
+        // Store the backend-generated QR data (proper format)
+        setQrData(JSON.stringify(qr_data));
+        setQrSignature(signature);
+        setExpiresAt(new Date(expires_at));
+      } else {
+        // Fallback to manual format if API fails
+        const fallbackData = {
+          type: 'payment_request',
+          qr_token: `web-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+          receiver_id: user.id || 0,
+          receiver_name: user.name,
+          receiver_phone: user.phone,
+          amount: amount ? parseFloat(amount) : null,
+          timestamp: new Date().toISOString(),
+          expires_at: new Date(Date.now() + 300000).toISOString() // 5 minutes
+        };
+        setQrData(JSON.stringify(fallbackData));
+        setExpiresAt(new Date(Date.now() + 300000));
+        toast.error('Using offline QR code');
+      }
+    } catch (error) {
+      console.error('QR generation error:', error);
+      
+      // Fallback format matching backend expectations
+      const fallbackData = {
+        type: 'payment_request',
+        qr_token: `web-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+        receiver_id: user.id || 0,
+        receiver_name: user.name,
+        receiver_phone: user.phone,
+        amount: amount ? parseFloat(amount) : null,
+        timestamp: new Date().toISOString(),
+        expires_at: new Date(Date.now() + 300000).toISOString()
+      };
+      setQrData(JSON.stringify(fallbackData));
+      setExpiresAt(new Date(Date.now() + 300000));
+      toast.error('Generated offline QR code');
+    }
+    setLoading(false);
   };
 
   const copyToClipboard = () => {
@@ -52,7 +113,7 @@ const QRPayment = () => {
     img.onload = () => {
       canvas.width = img.width;
       canvas.height = img.height;
-      ctx.fillStyle = '#000000';
+      ctx.fillStyle = '#ffffff';
       ctx.fillRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(img, 0, 0);
       
@@ -60,11 +121,19 @@ const QRPayment = () => {
       link.download = `bluepay-qr-${user?.phone || 'code'}.png`;
       link.href = canvas.toDataURL('image/png');
       link.click();
+      toast.success('QR Code downloaded');
     };
 
     img.src = 'data:image/svg+xml;base64,' + btoa(svgData);
-    toast.success('QR Code downloaded');
   };
+
+  // BluePay logo as base64 SVG for embedding in QR code
+  const bluePayLogo = `data:image/svg+xml;base64,${btoa(`
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+      <rect width="100" height="100" rx="20" fill="#3b82f6"/>
+      <text x="50" y="65" font-family="Arial, sans-serif" font-size="45" font-weight="bold" fill="white" text-anchor="middle">B</text>
+    </svg>
+  `)}`;
 
   return (
     <div style={styles.container}>
@@ -102,16 +171,37 @@ const QRPayment = () => {
         <div style={styles.receiveContainer}>
           {/* QR Code Display */}
           <div style={styles.qrCard}>
+            {/* Expiry Timer */}
+            {expiresAt && timeRemaining && timeRemaining !== 'Expired' && (
+              <div style={styles.expiryBadge}>
+                <Clock size={16} />
+                <span>Expires in {timeRemaining}</span>
+              </div>
+            )}
+
             <div style={styles.qrWrapper}>
-              {qrData ? (
+              {loading ? (
+                <div style={styles.qrPlaceholder}>
+                  <Loader size={48} color="#3b82f6" style={{ animation: 'spin 1s linear infinite' }} />
+                  <p style={{ marginTop: '12px', color: '#666', fontSize: '14px' }}>Generating...</p>
+                </div>
+              ) : qrData ? (
                 <QRCodeSVG
                   id="qr-code"
                   value={qrData}
-                  size={220}
+                  size={250}
                   level="H"
                   includeMargin={true}
                   bgColor="#ffffff"
                   fgColor="#000000"
+                  imageSettings={{
+                    src: bluePayLogo,
+                    x: undefined,
+                    y: undefined,
+                    height: 50,
+                    width: 50,
+                    excavate: true,
+                  }}
                 />
               ) : (
                 <div style={styles.qrPlaceholder}>
@@ -123,19 +213,24 @@ const QRPayment = () => {
             <div style={styles.userInfo}>
               <h3 style={styles.userName}>{user?.name}</h3>
               <p style={styles.userPhone}>{user?.phone}</p>
+              {amount && (
+                <div style={styles.amountBadge}>
+                  Request: <strong>{parseFloat(amount).toLocaleString()} Rwf</strong>
+                </div>
+              )}
             </div>
 
             {/* Actions */}
             <div style={styles.qrActions}>
-              <button style={styles.qrAction} onClick={copyToClipboard}>
+              <button style={styles.qrAction} onClick={copyToClipboard} disabled={!qrData}>
                 <Copy size={18} />
                 <span>Copy</span>
               </button>
-              <button style={styles.qrAction} onClick={downloadQR}>
+              <button style={styles.qrAction} onClick={downloadQR} disabled={!qrData}>
                 <Download size={18} />
                 <span>Download</span>
               </button>
-              <button style={styles.qrAction} onClick={generateQRCode}>
+              <button style={styles.qrAction} onClick={generateQRCode} disabled={loading}>
                 <RefreshCw size={18} />
                 <span>Refresh</span>
               </button>
@@ -159,19 +254,7 @@ const QRPayment = () => {
                   min="0"
                 />
               </div>
-            </div>
-
-            <div style={styles.inputGroup}>
-              <label style={styles.label}>Message (Optional)</label>
-              <div style={styles.inputWrapper}>
-                <input
-                  type="text"
-                  placeholder="Add a note"
-                  value={message}
-                  onChange={(e) => setMessage(e.target.value)}
-                  style={styles.input}
-                />
-              </div>
+              <p style={styles.inputHint}>Leave empty to allow any amount</p>
             </div>
           </div>
 
@@ -188,7 +271,18 @@ const QRPayment = () => {
             </div>
             <div style={styles.instruction}>
               <div style={styles.instructionNumber}>3</div>
-              <p style={styles.instructionText}>Confirm and receive your payment</p>
+              <p style={styles.instructionText}>Confirm and receive your payment instantly</p>
+            </div>
+          </div>
+
+          {/* Security Info */}
+          <div style={styles.securityCard}>
+            <div style={styles.securityIcon}>🔒</div>
+            <div>
+              <h5 style={styles.securityTitle}>Secure Payment</h5>
+              <p style={styles.securityText}>
+                QR codes expire after 5 minutes for your security. Generate a new code if expired.
+              </p>
             </div>
           </div>
         </div>
@@ -214,12 +308,19 @@ const QRPayment = () => {
               </div>
               <div style={styles.feature}>
                 <CheckCircle size={18} color="#10b981" />
-                <span>Instant payments</span>
+                <span>Instant and secure payments</span>
               </div>
             </div>
           </div>
         </div>
       )}
+
+      <style>{`
+        @keyframes spin {
+          from { transform: rotate(0deg); }
+          to { transform: rotate(360deg); }
+        }
+      `}</style>
     </div>
   );
 };
@@ -284,18 +385,36 @@ const styles = {
     borderRadius: '24px',
     padding: '32px',
     textAlign: 'center',
+    position: 'relative',
+  },
+  expiryBadge: {
+    position: 'absolute',
+    top: '16px',
+    right: '16px',
+    display: 'flex',
+    alignItems: 'center',
+    gap: '6px',
+    padding: '8px 14px',
+    background: 'rgba(59, 130, 246, 0.15)',
+    border: '1px solid rgba(59, 130, 246, 0.3)',
+    borderRadius: '20px',
+    color: '#3b82f6',
+    fontSize: '13px',
+    fontWeight: '600',
   },
   qrWrapper: {
     display: 'inline-block',
-    padding: '16px',
+    padding: '20px',
     background: '#fff',
     borderRadius: '20px',
     marginBottom: '20px',
+    boxShadow: '0 4px 12px rgba(0, 0, 0, 0.1)',
   },
   qrPlaceholder: {
-    width: '220px',
-    height: '220px',
+    width: '250px',
+    height: '250px',
     display: 'flex',
+    flexDirection: 'column',
     alignItems: 'center',
     justifyContent: 'center',
     background: '#f5f5f5',
@@ -313,12 +432,23 @@ const styles = {
   userPhone: {
     fontSize: '15px',
     color: '#888',
-    margin: 0,
+    margin: '0 0 12px 0',
+  },
+  amountBadge: {
+    display: 'inline-block',
+    padding: '8px 16px',
+    background: 'rgba(16, 185, 129, 0.15)',
+    border: '1px solid rgba(16, 185, 129, 0.3)',
+    borderRadius: '20px',
+    color: '#10b981',
+    fontSize: '14px',
+    fontWeight: '500',
   },
   qrActions: {
     display: 'flex',
     justifyContent: 'center',
     gap: '12px',
+    flexWrap: 'wrap',
   },
   qrAction: {
     display: 'flex',
@@ -347,7 +477,7 @@ const styles = {
     margin: '0 0 20px 0',
   },
   inputGroup: {
-    marginBottom: '16px',
+    marginBottom: '0',
   },
   label: {
     display: 'block',
@@ -372,6 +502,12 @@ const styles = {
     fontSize: '16px',
     color: '#fff',
     outline: 'none',
+  },
+  inputHint: {
+    marginTop: '8px',
+    fontSize: '12px',
+    color: '#666',
+    fontStyle: 'italic',
   },
   instructionsCard: {
     background: '#0a0a0a',
@@ -408,6 +544,31 @@ const styles = {
     color: '#aaa',
     fontSize: '14px',
     margin: 0,
+  },
+  securityCard: {
+    display: 'flex',
+    alignItems: 'flex-start',
+    gap: '16px',
+    background: 'rgba(59, 130, 246, 0.1)',
+    border: '1px solid rgba(59, 130, 246, 0.2)',
+    borderRadius: '16px',
+    padding: '20px',
+  },
+  securityIcon: {
+    fontSize: '32px',
+    flexShrink: 0,
+  },
+  securityTitle: {
+    fontSize: '15px',
+    fontWeight: '600',
+    color: '#fff',
+    margin: '0 0 6px 0',
+  },
+  securityText: {
+    fontSize: '13px',
+    color: '#aaa',
+    margin: 0,
+    lineHeight: '1.5',
   },
   scanContainer: {
     display: 'flex',
